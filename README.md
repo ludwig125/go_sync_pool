@@ -1,1 +1,1 @@
-# go_sync_pool
+# sync.Pool packageのサンプル
