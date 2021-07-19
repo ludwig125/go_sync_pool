@@ -14,10 +14,110 @@ https://golang.org/pkg/sync/#Pool
 - Poolの目的は、割り当てられたものの未使用のアイテムを、
   後で再利用するためにキャッシュし、ガベージコレクタの負担を軽減すること
 
-ということで、Poolに保存したキャッシュを使いまわすことで処理の効率化狙ったものらしいです
+ということで、Poolに保存したキャッシュを使いまわすことで処理の効率化を狙うことができます
 
+# 簡単な例
+
+簡単な例で動作を確認してみます。
+
+```golang
+package main
+
+import (
+	"fmt"
+	"runtime"
+	"sync"
+)
+
+func main() {
+	pool := &sync.Pool{ // <1> poolの定義
+		New: func() interface{} { // Poolから最初にGetした時はこのNew関数が呼ばれる
+			return &[]int{}
+		},
+	}
+
+	// append 10
+	l := pool.Get().(*[]int) // <2> poolから取得。[]int{}が取れる
+	fmt.Println("got slice", *l)
+	(*l) = append((*l), 10)
+	fmt.Println("after append", *l)
+	pool.Put(l) // <3> poolに戻す
+
+	// append 20
+	l = pool.Get().(*[]int) // <4> poolから取得。[]int{10}が取れる
+	fmt.Println("got slice", *l)
+	(*l) = append((*l), 20)
+	fmt.Println("after append", *l)
+	pool.Put(l) // poolに戻す
+
+	// ガベージコレクションをしてpoolの中身を消す
+	runtime.GC() // <5> GCをすると一次的なキャッシュのPoolの中身は消える
+
+	// append 30
+	l = pool.Get().(*[]int) // <6> poolから取得。[]int{}が取れる
+	fmt.Println("got slice", *l)
+	(*l) = append((*l), 30)
+	fmt.Println("after append", *l)
+	pool.Put(l) // poolに戻す
+}
+
+```
+
+このプログラムの実行結果は以下の通りです。
+
+```
+[~/go/src/github.com/ludwig125/sync-pool] $go run simple/simple.go
+got slice []
+after append [10]
+got slice [10]
+after append [10 20]
+got slice []
+after append [30]
+```
+
+このプログラムを順番に説明します。
+
+#### <1> poolの定義
+
+- 最初にPoolを定義します
+  - この例ではmain関数内で定義していますが、様々な関数から呼び出す場合はGlobal変数として定義することが多いです
+- Poolから最初にGetしたときに実行されるNew関数を定義しておきます
+- New関数では、pointerを返す必要があり、返り値はinterface型にするという注意点があります
+
+#### <2> PoolからGet
+
+- Poolから最初にGetした時は初めてインスタンスを作成するので、poolに定義したNew関数が実行されます
+- New関数の返り値はinterface型なので、型アサーション `.(*[]int)` をする必要があります
+
+- 私見ですが、型アサーションはプログラムを実行するまで気づけないので、重要な処理の場合はsync.Poolを使ったコードはテストによる動作の確認が必須と言えそうです
+
+#### <3> Put
+
+- PutでPoolに値を戻します
+- 一度Putで値を戻すと、次回以降のGetでは前の値を使うことができます
+
+#### <4> ２回目のGet
+
+- ２回目以降のGetでは前のPoolの値が取得できます
+
+#### <5> GCでPoolを消す
+
+- Poolはただのキャッシュなので、ガベージコレクション（GC）が走ると消えます
+- 公式のドキュメントではそれに該当する説明が以下にあります
+
+https://pkg.go.dev/sync#Pool
+
+> Pool's purpose is to cache allocated but unused items for later reuse, relieving pressure on the garbage collector. That is, it makes it easy to build efficient, thread-safe free lists. However, it is not suitable for all free lists.
+
+- ここでは意図的に`runtime.GC`関数でPoolの中身を消しています
+
+#### <6> 再度Poolから取得
+
+- 前述までのPoolの中身はGCで消えてしまったので、Getすると再びNew関数が呼ばれます
 
 # 公式のexample
+
+もう少しだけ実用的な使い方を見てみます。
 
 公式のexampleを見ると以下のようなコードがありました
 
@@ -68,11 +168,11 @@ func main() {
 
 ## 上の処理の内容
 
-上の処理を順番に見ていきます
+この例でも、同様に順番に見ていきます
 
 #### <1>, <2>
 
-上の例では、b(*bytes.Buffer)をbufPoolから取得しています。
+b(*bytes.Buffer)をbufPoolから取得しています。
 
 （もしPoolを使わない単純な方法であれば、この部分は、
 `b := new(bytes.Buffer)`または、`b := &bytes.Buffer{}`と書けるでしょう）
@@ -86,23 +186,10 @@ bufPoolのGetメソッドを呼び出すことで、事前に定義したNew関�
 やりたい処理が終わったら、
 bufPoolにPutメソッドを使ってbを戻しています。
 
-一度Putで値を戻すと、次回以降のGetでは、前の値を使うことができます。
-
 #### <4>
 
 ２回目以降はGetすると前の中身を取ってきてしまうので、
 `b.Reset()`で値を空にしています。
-
-## 注意点
-
-ここまでの注意点として、以下のような点があります。
-
-- New関数ではpointerを返す必要がある
-- New関数の返り値はinterface型
-- interface型なのでGetしたあとで、型アサーション `.(*bytes.Buffer)` をする必要がある
-
-特に型アサーションは実行するまで気づけないので、
-sync.Poolを使ったコードを書いたときはテストによる動作の確認が必須です。
 
 ## 公式のExampleコードの動作確認
 
@@ -739,11 +826,14 @@ PASS
 ok      github.com/ludwig125/sync-pool/join_str_revised 13.058s
 ```
 
+# appendを使った方法でアロケーション数が0になる理由は？
 
 上の気になる点は、appendを使う方法に変えたにもかかわらず、
 メモリのアロケーション回数、アロケーションされたバイト数は0のままなことです。
 
 appendをしているので少しは増えるかと思ったのですが、ここが0のままなのはなぜでしょう。。？
+
+## gcflags=-m で最適化の確認
 
 goのプログラムが変数を処理するとき、stack割り当てについてはBenchmarkはアロケーションに含めていません。heap割り当てのみが対象になります。
 
@@ -753,7 +843,7 @@ goのプログラムが変数を処理するとき、stack割り当てについ�
 - https://yoru9zine.hatenablog.com/entry/2016/08/31/055025
 
 そのため、アロケーションが0ということは、`ReplicateStrNTimesWithPool`はheapではなく
-すべてstack割り当てをしているか、どこにも割り当てしていないということになります。
+すべてstack割り当てをしているか、どこにも割り当てしていないということになってしまいます。
 
 確認するために、上のBenchmark実行時に`-gcflags=-m`オプションを渡してみました。
 `-gcflags=-m`オプションをつけると、build時、test時に内部の変数がheap割り当てになるかなどの、最適化を確認することができます。
@@ -784,6 +874,14 @@ goのプログラムが変数を処理するとき、stack割り当てについ�
 一方で`ReplicateStrNTimesWithPool`はそれにあたるものが出ていません。
 もしstack割り当てが発生しているとしたら、`does not escape`というheapに変数を退避させなかったメッセージが出るのですが、それも出ていません。
 
+なので、最適化の結果だけを見ると、appendにした場合のsliceについて heapにもstackにも割り当てされている様子が見えない
+
+=> 新たな割り当てが起きていない？
+
+という謎なことになりました。これはおかしいです。
+
+## appendの場合のアロケーションが0となってしまう原因の推測
+
 おそらく、appendでcapを拡張するのは毎回行うことではないからでは、という推測をしています。
 
 capは最初0で、次にappendされるたびに1、2、4, 8, 16と倍々に増やされますが、
@@ -791,9 +889,12 @@ capは最初0で、次にappendされるたびに1、2、4, 8, 16と倍々に増
 次に要素数が17になるときにcapは32に拡張されますが、
 そうなると、要素数18~32の間は同じく拡張されず、次に拡張されるのは33番目を追加するタイミングです。
 
-そこで、試しに以下のように、`(*ss)[:0]`ではなく毎回nilに初期化するようにしてみました。
+もしcapが拡張されないタイミングを測定したらアロケーションは0になるはずです。
 
-#### 毎回nilにする場合のアロケーション回数の確認
+## 毎回nilにする場合のアロケーション回数の確認
+
+そこで、試しに以下のように、`(*ss) = (*ss)[:0]`ではなく、
+`(*ss) = nil`として、sliceをメモリごと初期化するようにしてみました。
 
 ```golang
 func ReplicateStrNTimesWithPool(s string, n int) []string {
@@ -876,7 +977,7 @@ func BenchmarkReplicateStrNTimesWithPool(b *testing.B) {
 
 よくわからないので次に単純なサンプルで確認してみました。
 
-#### Allocsの確認
+## Allocsの確認（AllocsPerRunで確認）
 
 testingパッケージにはAllocsPerRunという関数があります。
 
@@ -1056,26 +1157,7 @@ mallocs: 0, memstats.Mallocs(before 279 ->after 279). run: 2
 MyAllocs: 0
 ```
 
-ちなみに、ここまで`testing.AllocsPerRun`の挙動を書きましたが、Benchmarkのアロケーションのカウントも同じように
-`memstats.Mallocs`の差分を実行回数で割るという方法は変わりません。
-
-Benchmarkでも、以下のように最初の時点のmalloc数との差分を取ってから、
-
-```golang
-runtime.ReadMemStats(&memStats)
-b.netAllocs += memStats.Mallocs - b.startAllocs
-```
-
-- https://github.com/golang/go/blob/0941dbca6ae805dd7b5f7871d5811b7b7f14f77f/src/testing/benchmark.go#L123-L124
-- https://github.com/golang/go/blob/0941dbca6ae805dd7b5f7871d5811b7b7f14f77f/src/testing/benchmark.go#L137-L138
-
-実行回数で割っています
-```golang
-int64(r.MemAllocs) / int64(r.N)
-```
-
-- https://github.com/golang/go/blob/0941dbca6ae805dd7b5f7871d5811b7b7f14f77f/src/testing/benchmark.go#L389-L397
-
+## Allocsの確認（直接runtime.ReadMemStatsで確認）
 
 アロケーションが0とカウントされる原因がかなり分かってきたので、
 
@@ -1228,18 +1310,149 @@ mallocs: 0, memstats.Mallocs(before 284 ->after 284). IN FUNC
 
 `testing.AllocsPerRun` はmallocの計測前に関数を１回実行するので、それ以降の実行時のアロケーションは0になるからです。
 
+## Allocsの確認（Benchmarkのコードを確認）
+
 同様のことがBenchmarkにも言えそうです。
-<!--
-Benchmarkでは、
-最初に`b.run1()`と１回だけ実行してから、そのあとメインの`r := b.doBench()`をしています。
+
+Benchmarkのアロケーションのカウントも同じように
+`memstats.Mallocs`の差分を実行回数で割るという方法は変わりません。
+
+Benchmarkでも、以下のように最初の時点のmalloc数との差分を取ってから、
+
+```golang
+runtime.ReadMemStats(&memStats)
+b.netAllocs += memStats.Mallocs - b.startAllocs
+```
+
+- https://github.com/golang/go/blob/0941dbca6ae805dd7b5f7871d5811b7b7f14f77f/src/testing/benchmark.go#L123-L124
+- https://github.com/golang/go/blob/0941dbca6ae805dd7b5f7871d5811b7b7f14f77f/src/testing/benchmark.go#L137-L138
+
+実行回数で割っています
+```golang
+int64(r.MemAllocs) / int64(r.N)
+```
+
+- https://github.com/golang/go/blob/0941dbca6ae805dd7b5f7871d5811b7b7f14f77f/src/testing/benchmark.go#L389-L397
+
+また、Benchmarkでは、
+最初に`b.run1()`と１回だけ実行してから、そのあとメインの`r := b.doBench()`をしているようです。
 - https://github.com/golang/go/blob/0941dbca6ae805dd7b5f7871d5811b7b7f14f77f/src/testing/benchmark.go#L568-L583
 
 
-一番最初の疑問の、`ReplicateStrNTimesWithPool`関数でappendをしているのに、アロケーション数が0になる原因は以上の調査で説明がつきました。
+さらに、この`doBench`関数の先を見ていくと、Benchmarkの測定対象である`runN`関数内では、事前にGCをしていることが分かりました。
+事前に`run1`でPoolに何か書き込まれても、GCで空になるので次の関数実行タイミングではまっさらの状態からのメモリ割り当てが置きそうです。
 
-- Benchmarkでは最初の１回のみアロケーションが実行される関数についてはアロケーション数0となる
-  - ゆえに、`ReplicateStrNTimesWithPool("12345", 1)`と１つだけ実行したつもりでも、おそらくBenchmarkでは2回実行されるので２回目のアロケーション数が0とカウントされているはずです
-- `ReplicateStrNTimesWithPool`関数のように、 -->
+```golang
+// Try to get a comparable environment for each run
+// by clearing garbage from previous runs.
+runtime.GC()  <- ガベージコレクションをするのでPoolの中身が空になる
+b.raceErrors = -race.Errors()
+b.N = n
+b.parallelism = 1
+b.ResetTimer()
+b.StartTimer()
+b.benchFunc(b) <- ここで関数を実行
+```
+
+- https://github.com/golang/go/blob/0941dbca6ae805dd7b5f7871d5811b7b7f14f77f/src/testing/benchmark.go#L186
+
+
+確認するために、`ReplicateStrNTimesWithPool` 関数内でグローバル変数`cnt`をインクリメントして、Benchmark時に出力するようにしてみます。
+
+またBenchmark関数内は１回だけ実行するように`for n := 0; n < b.N; n++ {`をやめます。
+
+```golang
+package main
+
+import (
+	"fmt"
+	"sync"
+	"testing"
+)
+
+var pool = &sync.Pool{
+	New: func() interface{} {
+		return &[]string{}
+	},
+}
+
+func ReplicateStrNTimesWithPool(s string, n int) []string {
+	cnt++
+	ss := pool.Get().(*[]string)
+
+	(*ss) = (*ss)[:0]
+	defer pool.Put(ss)
+	for i := 0; i < n; i++ {
+		(*ss) = append((*ss), s)
+	}
+	return *ss
+}
+
+var Result []string
+
+var cnt int
+
+func BenchmarkReplicateStrNTimesWithPool(b *testing.B) {
+	b.ReportAllocs()
+	Result = ReplicateStrNTimesWithPool("12345", 1)
+	fmt.Printf("\ncnt %d\n", cnt)
+}
+```
+
+そして、Benchmarkを測定するときに、実行回数が確実に１回だけになるように
+`-benchtime=1x` を指定、さらに余計な並行処理をしないように `-cpu 1`とします。
+
+Benchmarkのオプションについては公式ドキュメントを参考にしています。
+
+- https://pkg.go.dev/cmd/go#hdr-Testing_flags
+
+この実行結果は以下の通りです。
+
+```
+[~/go/src/github.com/ludwig125/sync-pool/replicate_str_revised_run1] $go test -bench . -benchtime=1x -cpu 1
+
+cnt 1
+goos: linux
+goarch: amd64
+pkg: github.com/ludwig125/sync-pool/replicate_str_revised_run1
+BenchmarkReplicateStrNTimesWithPool
+cnt 2
+       1             51800 ns/op             280 B/op          4 allocs/op
+PASS
+ok      github.com/ludwig125/sync-pool/replicate_str_revised_run1       0.004s
+```
+
+想定通り、Benchmarkの測定前に１回関数が実行されているので、`cnt 1`が最初にでます。
+
+そのあとで、やはり１回だけ関数が実行されて`cnt 2`となり、メモリアロケーションは `4 allocs/op`となりました。
+この `4 allocs/op`というのは、前述の「PoolからのGet: 3」+「append: 1」で確認した４という数字と一致します。
+
+先に書いた通り、Benchmarkのアロケーション数は、「実際のアロケーション数／関数の実行回数」となるので、
+`benchtime=5x` のように５回以上を指定すれば、`4/5` は１未満になるので、結果は`0 allocs/op`とみなされます。
+
+以下の通りです。
+
+```
+[~/go/src/github.com/ludwig125/sync-pool/replicate_str_revised_run1] $go test -bench . -benchtime=5x -cpu 1
+
+cnt 1
+goos: linux
+goarch: amd64
+pkg: github.com/ludwig125/sync-pool/replicate_str_revised_run1
+BenchmarkReplicateStrNTimesWithPool
+cnt 2
+       5             10540 ns/op              56 B/op          0 allocs/op
+PASS
+ok      github.com/ludwig125/sync-pool/replicate_str_revised_run1       0.004s
+[~/go/src/github.com/ludwig125/sync-pool/replicate_str_revised_run1] $
+```
+
+これで、
+一番最初の疑問の、`ReplicateStrNTimesWithPool`関数でappendをしているのに、アロケーション数が0になる原因がはっきりと分かりました。
+
+Benchmarkでは実際にアロケーションがあっても、実行回数で割った時に１未満になる時は0と出力される、という単純なことでした。
+
+この確認にずいぶんと時間がかかりましたが、Benchmark関数の挙動の理解ができて満足です。
 
 
 # sync.Poolを使ったjsonデコードの例
@@ -1250,6 +1463,8 @@ Benchmarkでは、
 そこで、他にもそういう操作があれば高速化してみたいです。
 
 分かりやすそうなのがjsonのデコードです。
+
+## 一般的なjsonデコード
 
 例えば文字列を構造体にDecodeするコードは単純に書くと以下になります。
 
@@ -1271,4 +1486,286 @@ func DecodeJSON(in string) (JsonData, error) {
 
 この例では、`res`という`JsonData`型の入れ物を用意しておいて、そこにデコード（Unmarshal）した結果を入れています。
 
-ちなみに、Webリクエストの結果をdecodeしたい場合は
+ちなみに、Webリクエストの結果のようにStreamのデータをdecodeしたい場合は一旦バッファを確保してからデコードするために、
+以下のような`json.NewDecoder.Decode` を使った方法があります。
+
+
+```golang
+
+func DecodeJSONStream(in io.Reader) (JsonData, error) {
+	var res JsonData
+	if err := json.NewDecoder(in).Decode(&res); err != nil {
+		return JsonData{}, err
+	}
+	return res, nil
+}
+```
+
+#### 参考：GoでJSONのデコードをするときの、UnmarshalとNewDecoder.Decodeの違いについて
+
+- https://stackoverflow.com/questions/21197239/decoding-json-using-json-unmarshal-vs-json-newdecoder-decode
+
+以下のように使い分ければ良いです
+
+- Unmarshalは、ファイルなどから読み込んだデータをデコードするとき
+- NewDecoder.Decodeは、httpでのGetのように終わりが見えていないデータをデコードするとき
+
+`NewDecoder.Decode`について公式のドキュメントには以下のように書いてあります。
+
+- https://blog.golang.org/json#TOC_7.
+
+> such as reading and writing to HTTP connections, WebSockets, or files.
+
+#### UnmarshalとNewDecoder.Decodeの処理の違い
+
+通常のUnmarshalはunmarshalメソッドをほぼ直接呼んでいるのに対して、
+
+- https://github.com/golang/go/blob/ab4085ce84f8378b4ec2dfdbbc44c98cb92debe5/src/encoding/json/decode.go#L96-L108
+
+Decodeの方は、一旦バッファを確保してからunmarshalメソッドを呼んでいます。
+
+- https://github.com/golang/go/blob/296ddf2a936a30866303a64d49bc0e3e034730a8/src/encoding/json/stream.go#L31-L79
+
+ということで、
+
+**最終的にどちらもunmarshal関数を呼んでいますが、すでにメモリに置かれたデータをデコードする場合はバッファを確保する分だけNewDecoder.Decodeの方が遅くなりそうです**
+
+## sync.Poolを使ったjsonデコード
+
+上のjsonデコードを、sync.Poolを使って書き直した関数を加えて、Benchmarkを取ってみます。
+
+以下ではデコードした結果を入れるPoolとして`decRespPool`を用意しました。
+
+また、それぞれのデコード結果が同じであることは、`TestDecodeJSON`で確認しました。
+
+（エンコード用の関数`EncodeJSON`はおまけです）
+
+```golang
+package main
+
+import (
+	"encoding/json"
+	"io"
+	"strings"
+	"sync"
+	"testing"
+
+	"github.com/google/go-cmp/cmp"
+)
+
+type JsonData struct {
+	ID    int      `json:"id"`
+	Name  string   `json:"name"`
+	Items []string `json:"items"`
+}
+
+func EncodeJSON(in JsonData) (string, error) {
+	res, err := json.Marshal(in)
+	if err != nil {
+		return "", err
+	}
+	return string(res), nil
+}
+
+func DecodeJSON(in string) (JsonData, error) {
+	var res JsonData
+	if err := json.Unmarshal([]byte(in), &res); err != nil {
+		return JsonData{}, err
+	}
+	return res, nil
+}
+
+func DecodeJSONStream(in io.Reader) (JsonData, error) {
+	var res JsonData
+	if err := json.NewDecoder(in).Decode(&res); err != nil {
+		return JsonData{}, err
+	}
+	return res, nil
+}
+
+var decRespPool = &sync.Pool{
+	New: func() interface{} {
+		return &JsonData{}
+	},
+}
+
+func DecodeJSONWithPool(in string) (JsonData, error) {
+	res := decRespPool.Get().(*JsonData)
+	defer decRespPool.Put(res)
+
+	if err := json.Unmarshal([]byte(in), &res); err != nil {
+		return JsonData{}, err
+	}
+	return *res, nil
+}
+
+func DecodeJSONStreamWithPool(in io.Reader) (JsonData, error) {
+	res := decRespPool.Get().(*JsonData)
+	defer decRespPool.Put(res)
+
+	if err := json.NewDecoder(in).Decode(&res); err != nil {
+		return JsonData{}, err
+	}
+	return *res, nil
+}
+
+func TestDecodeJSON(t *testing.T) {
+	t.Run("EncodeJSON", func(t *testing.T) {
+		data := JsonData{
+			ID:    1,
+			Name:  "Jack",
+			Items: []string{"knife", "shield", "herbs"},
+		}
+		got, err := EncodeJSON(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := `{"id":1,"name":"Jack","items":["knife","shield","herbs"]}`
+		if got != want {
+			t.Errorf("got: %s, want: %s", got, want)
+		}
+	})
+
+	encodedData := `{"id":1,"name":"Jack","items":["knife","shield","herbs"]}`
+	t.Run("DecodeJSON", func(t *testing.T) {
+		got, err := DecodeJSON(encodedData)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := JsonData{
+			ID:    1,
+			Name:  "Jack",
+			Items: []string{"knife", "shield", "herbs"},
+		}
+		if diff := cmp.Diff(got, want); diff != "" {
+			t.Errorf("got: %v,want: %v, diff: %s", got, want, diff)
+		}
+	})
+	t.Run("DecodeJSONStream", func(t *testing.T) {
+		data := strings.NewReader(encodedData)
+		got, err := DecodeJSONStream(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := JsonData{
+			ID:    1,
+			Name:  "Jack",
+			Items: []string{"knife", "shield", "herbs"},
+		}
+		if diff := cmp.Diff(got, want); diff != "" {
+			t.Errorf("got: %v,want: %v, diff: %s", got, want, diff)
+		}
+	})
+
+	// 以下は上の関数のPool対応版
+	t.Run("DecodeJSONWithPool", func(t *testing.T) {
+		got, err := DecodeJSONWithPool(encodedData)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := JsonData{
+			ID:    1,
+			Name:  "Jack",
+			Items: []string{"knife", "shield", "herbs"},
+		}
+		if diff := cmp.Diff(got, want); diff != "" {
+			t.Errorf("got: %v,want: %v, diff: %s", got, want, diff)
+		}
+	})
+	t.Run("DecodeJSONStreamWithPool", func(t *testing.T) {
+		data := strings.NewReader(encodedData)
+		got, err := DecodeJSONStreamWithPool(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := JsonData{
+			ID:    1,
+			Name:  "Jack",
+			Items: []string{"knife", "shield", "herbs"},
+		}
+		if diff := cmp.Diff(got, want); diff != "" {
+			t.Errorf("got: %v,want: %v, diff: %s", got, want, diff)
+		}
+	})
+}
+
+var Result JsonData
+
+var encodedData = `{"id":1,"name":"Jack","items":["knife","shield","herbs"]}`
+
+func BenchmarkDecodeJSON(b *testing.B) {
+	b.ReportAllocs()
+	var r JsonData
+	for n := 0; n < b.N; n++ {
+		res, _ := DecodeJSON(encodedData)
+		r = res
+	}
+	Result = r
+}
+
+func BenchmarkDecodeJSONWithPool(b *testing.B) {
+	b.ReportAllocs()
+	var r JsonData
+	for n := 0; n < b.N; n++ {
+		res, _ := DecodeJSONWithPool(encodedData)
+		r = res
+	}
+	Result = r
+}
+
+func BenchmarkDecodeJSONStream(b *testing.B) {
+	b.ReportAllocs()
+	var r JsonData
+	for n := 0; n < b.N; n++ {
+		data := strings.NewReader(encodedData)
+		res, _ := DecodeJSONStream(data)
+		r = res
+	}
+	Result = r
+}
+
+func BenchmarkDecodeJSONStreamWithPool(b *testing.B) {
+	b.ReportAllocs()
+	var r JsonData
+	for n := 0; n < b.N; n++ {
+		data := strings.NewReader(encodedData)
+		res, _ := DecodeJSONStreamWithPool(data)
+		r = res
+	}
+	Result = r
+}
+```
+
+４回ずつBenchmarkを実行した結果は以下の通りです。
+
+```
+[~/go/src/github.com/ludwig125/sync-pool/json] $go test -bench . -count=4
+goos: linux
+goarch: amd64
+pkg: github.com/ludwig125/sync-pool/json
+BenchmarkDecodeJSON-8                     634494              1900 ns/op             448 B/op         12 allocs/op
+BenchmarkDecodeJSON-8                     555051              1906 ns/op             448 B/op         12 allocs/op
+BenchmarkDecodeJSON-8                     570580              1939 ns/op             448 B/op         12 allocs/op
+BenchmarkDecodeJSON-8                     532183              1986 ns/op             448 B/op         12 allocs/op
+BenchmarkDecodeJSONWithPool-8             690313              1798 ns/op             312 B/op         10 allocs/op
+BenchmarkDecodeJSONWithPool-8             712689              1736 ns/op             312 B/op         10 allocs/op
+BenchmarkDecodeJSONWithPool-8             626592              1945 ns/op             312 B/op         10 allocs/op
+BenchmarkDecodeJSONWithPool-8             632752              1680 ns/op             312 B/op         10 allocs/op
+BenchmarkDecodeJSONStream-8               448029              2236 ns/op            1136 B/op         15 allocs/op
+BenchmarkDecodeJSONStream-8               518344              2251 ns/op            1136 B/op         15 allocs/op
+BenchmarkDecodeJSONStream-8               490837              2419 ns/op            1136 B/op         15 allocs/op
+BenchmarkDecodeJSONStream-8               473403              2317 ns/op            1136 B/op         15 allocs/op
+BenchmarkDecodeJSONStreamWithPool-8       491476              2225 ns/op            1000 B/op         13 allocs/op
+BenchmarkDecodeJSONStreamWithPool-8       555782              2056 ns/op            1000 B/op         13 allocs/op
+BenchmarkDecodeJSONStreamWithPool-8       509203              2063 ns/op            1000 B/op         13 allocs/op
+BenchmarkDecodeJSONStreamWithPool-8       541905              2097 ns/op            1000 B/op         13 allocs/op
+PASS
+ok      github.com/ludwig125/sync-pool/json     22.339s
+[~/go/src/github.com/ludwig125/sync-pool/json] $
+```
+
+前述の通り、Streamを扱う`NewDecoder.Decode`は最初にバッファを確保する分、単純な`Unmarshal`に比べて時間もメモリアロケーションも余計にかかるようです。
+
+肝心のsync.Poolを使った場合の改善度合いですが、
+
+`BenchmarkDecodeJSON`と`BenchmarkDecodeJSONWithPool`、`BenchmarkDecodeJSONStream`と`BenchmarkDecodeJSONStreamWithPool`をそれぞれ比較して、そこまでの改善はありませんでした。
