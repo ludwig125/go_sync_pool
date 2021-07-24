@@ -1455,7 +1455,7 @@ Benchmarkでは実際にアロケーションがあっても、実行回数で�
 この確認にずいぶんと時間がかかりましたが、Benchmark関数の挙動の理解ができて満足です。
 
 
-# sync.Poolを使ったjsonデコードの例
+# sync.Poolを使ったjsonデコード・エンコードの例
 
 ここまで使ってみて、sync.Poolが特に役に立つのは、
 `データの入れ物を事前に用意してそこにデータを詰める` 作業なのだろうと私なりに理解しました。
@@ -1530,20 +1530,52 @@ Decodeの方は、一旦バッファを確保してからunmarshalメソッド�
 
 **最終的にどちらもunmarshal関数を呼んでいますが、すでにメモリに置かれたデータをデコードする場合はバッファを確保する分だけNewDecoder.Decodeの方が遅くなりそうです**
 
-## sync.Poolを使ったjsonデコード
 
-上のjsonデコードを、sync.Poolを使って書き直した関数を加えて、Benchmarkを取ってみます。
+## 一般的なjsonエンコード
 
-以下ではデコードした結果を入れるPoolとして`decRespPool`を用意しました。
+デコードと同様に、エンコードでもメモリ上のデータをエンコードする`json.Marshal`と、
+Streamデータをエンコードする`json.NewEncoder.Encode`があります。
 
-また、それぞれのデコード結果が同じであることは、`TestDecodeJSON`で確認しました。
+HTTPリクエストのような処理では、大抵エンコードされたデータをStreamとして受け取ってデコードすることが私の経験では多かったので、Streamのデータをエンコードすることはなかったのですが、一応見ておきます。
 
-（エンコード用の関数`EncodeJSON`はおまけです）
+```golang
+func EncodeJSON(in JsonData) (string, error) {
+	res, err := json.Marshal(in)
+	if err != nil {
+		return "", err
+	}
+	return string(res), nil
+}
+
+func EncodeJSONStream(in JsonData) (string, error) {
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(in); err != nil {
+		return "", err
+	}
+	return strings.TrimRight(buf.String(), "\n"), nil
+}
+```
+
+
+## sync.Poolを使ったjsonデコード・エンコード
+
+上のjsonデコード・エンコードを、sync.Poolを使って書き直した関数を加えて、Benchmarkを取ってみます。
+
+以下のようなPoolを用意します
+
+- `decRespPool`: デコード時の入れ物となる`bytes.Buffer`のPool
+- `encRespPool`: エンコード時の入れ物となる`bytes.Buffer`のPool
+
+エンコードの場合は、Stream処理の`EncodeJSONStream`のみをPoolで書き換えました。
+
+また、それぞれのデコード・エンコード結果が同じであることは、Testで確認しました。
+
 
 ```golang
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"strings"
@@ -1565,6 +1597,31 @@ func EncodeJSON(in JsonData) (string, error) {
 		return "", err
 	}
 	return string(res), nil
+}
+
+func EncodeJSONStream(in JsonData) (string, error) {
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(in); err != nil {
+		return "", err
+	}
+	return strings.TrimRight(buf.String(), "\n"), nil
+}
+
+var encRespPool = &sync.Pool{
+	New: func() interface{} {
+		return &bytes.Buffer{}
+	},
+}
+
+func EncodeJSONStreamWithPool(in JsonData) (string, error) {
+	buf := encRespPool.Get().(*bytes.Buffer)
+	defer encRespPool.Put(buf)
+
+	buf.Reset() // 前のデータが残ったままなのでresetする
+	if err := json.NewEncoder(buf).Encode(in); err != nil {
+		return "", err
+	}
+	return strings.TrimRight(buf.String(), "\n"), nil
 }
 
 func DecodeJSON(in string) (JsonData, error) {
@@ -1609,130 +1666,172 @@ func DecodeJSONStreamWithPool(in io.Reader) (JsonData, error) {
 	return *res, nil
 }
 
-func TestDecodeJSON(t *testing.T) {
-	t.Run("EncodeJSON", func(t *testing.T) {
-		data := JsonData{
-			ID:    1,
-			Name:  "Jack",
-			Items: []string{"knife", "shield", "herbs"},
-		}
-		got, err := EncodeJSON(data)
-		if err != nil {
-			t.Fatal(err)
-		}
-		want := `{"id":1,"name":"Jack","items":["knife","shield","herbs"]}`
-		if got != want {
-			t.Errorf("got: %s, want: %s", got, want)
-		}
-	})
+func TestEncodeJSON(t *testing.T) {
+	data := JsonData{
+		ID:    1,
+		Name:  "Jack",
+		Items: []string{"knife", "shield", "herbs"},
+	}
+	want := `{"id":1,"name":"Jack","items":["knife","shield","herbs"]}`
 
-	encodedData := `{"id":1,"name":"Jack","items":["knife","shield","herbs"]}`
-	t.Run("DecodeJSON", func(t *testing.T) {
-		got, err := DecodeJSON(encodedData)
-		if err != nil {
-			t.Fatal(err)
-		}
-		want := JsonData{
-			ID:    1,
-			Name:  "Jack",
-			Items: []string{"knife", "shield", "herbs"},
-		}
-		if diff := cmp.Diff(got, want); diff != "" {
-			t.Errorf("got: %v,want: %v, diff: %s", got, want, diff)
-		}
-	})
-	t.Run("DecodeJSONStream", func(t *testing.T) {
-		data := strings.NewReader(encodedData)
-		got, err := DecodeJSONStream(data)
-		if err != nil {
-			t.Fatal(err)
-		}
-		want := JsonData{
-			ID:    1,
-			Name:  "Jack",
-			Items: []string{"knife", "shield", "herbs"},
-		}
-		if diff := cmp.Diff(got, want); diff != "" {
-			t.Errorf("got: %v,want: %v, diff: %s", got, want, diff)
-		}
-	})
-
-	// 以下は上の関数のPool対応版
-	t.Run("DecodeJSONWithPool", func(t *testing.T) {
-		got, err := DecodeJSONWithPool(encodedData)
-		if err != nil {
-			t.Fatal(err)
-		}
-		want := JsonData{
-			ID:    1,
-			Name:  "Jack",
-			Items: []string{"knife", "shield", "herbs"},
-		}
-		if diff := cmp.Diff(got, want); diff != "" {
-			t.Errorf("got: %v,want: %v, diff: %s", got, want, diff)
-		}
-	})
-	t.Run("DecodeJSONStreamWithPool", func(t *testing.T) {
-		data := strings.NewReader(encodedData)
-		got, err := DecodeJSONStreamWithPool(data)
-		if err != nil {
-			t.Fatal(err)
-		}
-		want := JsonData{
-			ID:    1,
-			Name:  "Jack",
-			Items: []string{"knife", "shield", "herbs"},
-		}
-		if diff := cmp.Diff(got, want); diff != "" {
-			t.Errorf("got: %v,want: %v, diff: %s", got, want, diff)
-		}
-	})
+	// Poolを正しく使わないと前にPutした値をGetで取ってきてしまうミスがあり得る
+	// そのため、２回実行しても同じ結果であることを確認している
+	for i := 0; i < 2; i++ {
+		t.Run("EncodeJSON", func(t *testing.T) {
+			got, err := EncodeJSON(data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != want {
+				t.Errorf("got: %s, want: %s", got, want)
+			}
+		})
+		t.Run("EncodeJSONStream", func(t *testing.T) {
+			got, err := EncodeJSONStream(data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != want {
+				t.Errorf("got: %s, want: %s", got, want)
+			}
+		})
+		t.Run("EncodeJSONStreamWithPool", func(t *testing.T) {
+			got, err := EncodeJSONStreamWithPool(data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != want {
+				t.Errorf("got: %s, want: %s", got, want)
+			}
+		})
+	}
 }
 
-var Result JsonData
+func TestDecodeJSON(t *testing.T) {
+	encodedData := `{"id":1,"name":"Jack","items":["knife","shield","herbs"]}`
+	want := JsonData{
+		ID:    1,
+		Name:  "Jack",
+		Items: []string{"knife", "shield", "herbs"},
+	}
 
-var encodedData = `{"id":1,"name":"Jack","items":["knife","shield","herbs"]}`
+	for i := 0; i < 2; i++ {
+		t.Run("DecodeJSON", func(t *testing.T) {
+			got, err := DecodeJSON(encodedData)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if diff := cmp.Diff(got, want); diff != "" {
+				t.Errorf("got: %v,want: %v, diff: %s", got, want, diff)
+			}
+		})
+		t.Run("DecodeJSONStream", func(t *testing.T) {
+			data := strings.NewReader(encodedData)
+			got, err := DecodeJSONStream(data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if diff := cmp.Diff(got, want); diff != "" {
+				t.Errorf("got: %v,want: %v, diff: %s", got, want, diff)
+			}
+		})
+		t.Run("DecodeJSONWithPool", func(t *testing.T) {
+			got, err := DecodeJSONWithPool(encodedData)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if diff := cmp.Diff(got, want); diff != "" {
+				t.Errorf("got: %v,want: %v, diff: %s", got, want, diff)
+			}
+		})
+		t.Run("DecodeJSONStreamWithPool", func(t *testing.T) {
+			data := strings.NewReader(encodedData)
+			got, err := DecodeJSONStreamWithPool(data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if diff := cmp.Diff(got, want); diff != "" {
+				t.Errorf("got: %v,want: %v, diff: %s", got, want, diff)
+			}
+		})
+	}
+}
+
+var (
+	EncResult string
+	JData     = JsonData{
+		ID:    1,
+		Name:  "Jack",
+		Items: []string{"knife", "shield", "herbs"},
+	}
+
+	DecResult JsonData
+	SData     = `{"id":1,"name":"Jack","items":["knife","shield","herbs"]}`
+)
+
+func BenchmarkEncodeJSON(b *testing.B) {
+	b.ReportAllocs()
+	var r string
+	for n := 0; n < b.N; n++ {
+		r, _ = EncodeJSON(JData)
+	}
+	EncResult = r
+}
+
+func BenchmarkEncodeJSONStream(b *testing.B) {
+	b.ReportAllocs()
+	var r string
+	for n := 0; n < b.N; n++ {
+		r, _ = EncodeJSONStream(JData)
+	}
+	EncResult = r
+}
+
+func BenchmarkEncodeJSONStreamWithPool(b *testing.B) {
+	b.ReportAllocs()
+	var r string
+	for n := 0; n < b.N; n++ {
+		r, _ = EncodeJSONStreamWithPool(JData)
+	}
+	EncResult = r
+}
 
 func BenchmarkDecodeJSON(b *testing.B) {
 	b.ReportAllocs()
 	var r JsonData
 	for n := 0; n < b.N; n++ {
-		res, _ := DecodeJSON(encodedData)
-		r = res
+		r, _ = DecodeJSON(SData)
 	}
-	Result = r
+	DecResult = r
 }
 
 func BenchmarkDecodeJSONWithPool(b *testing.B) {
 	b.ReportAllocs()
 	var r JsonData
 	for n := 0; n < b.N; n++ {
-		res, _ := DecodeJSONWithPool(encodedData)
-		r = res
+		r, _ = DecodeJSONWithPool(SData)
 	}
-	Result = r
+	DecResult = r
 }
 
 func BenchmarkDecodeJSONStream(b *testing.B) {
 	b.ReportAllocs()
 	var r JsonData
 	for n := 0; n < b.N; n++ {
-		data := strings.NewReader(encodedData)
-		res, _ := DecodeJSONStream(data)
-		r = res
+		data := strings.NewReader(SData)
+		r, _ = DecodeJSONStream(data)
 	}
-	Result = r
+	DecResult = r
 }
 
 func BenchmarkDecodeJSONStreamWithPool(b *testing.B) {
 	b.ReportAllocs()
 	var r JsonData
 	for n := 0; n < b.N; n++ {
-		data := strings.NewReader(encodedData)
-		res, _ := DecodeJSONStreamWithPool(data)
-		r = res
+		data := strings.NewReader(SData)
+		r, _ = DecodeJSONStreamWithPool(data)
 	}
-	Result = r
+	DecResult = r
 }
 ```
 
@@ -1743,29 +1842,62 @@ func BenchmarkDecodeJSONStreamWithPool(b *testing.B) {
 goos: linux
 goarch: amd64
 pkg: github.com/ludwig125/sync-pool/json
-BenchmarkDecodeJSON-8                     634494              1900 ns/op             448 B/op         12 allocs/op
-BenchmarkDecodeJSON-8                     555051              1906 ns/op             448 B/op         12 allocs/op
-BenchmarkDecodeJSON-8                     570580              1939 ns/op             448 B/op         12 allocs/op
-BenchmarkDecodeJSON-8                     532183              1986 ns/op             448 B/op         12 allocs/op
-BenchmarkDecodeJSONWithPool-8             690313              1798 ns/op             312 B/op         10 allocs/op
-BenchmarkDecodeJSONWithPool-8             712689              1736 ns/op             312 B/op         10 allocs/op
-BenchmarkDecodeJSONWithPool-8             626592              1945 ns/op             312 B/op         10 allocs/op
-BenchmarkDecodeJSONWithPool-8             632752              1680 ns/op             312 B/op         10 allocs/op
-BenchmarkDecodeJSONStream-8               448029              2236 ns/op            1136 B/op         15 allocs/op
-BenchmarkDecodeJSONStream-8               518344              2251 ns/op            1136 B/op         15 allocs/op
-BenchmarkDecodeJSONStream-8               490837              2419 ns/op            1136 B/op         15 allocs/op
-BenchmarkDecodeJSONStream-8               473403              2317 ns/op            1136 B/op         15 allocs/op
-BenchmarkDecodeJSONStreamWithPool-8       491476              2225 ns/op            1000 B/op         13 allocs/op
-BenchmarkDecodeJSONStreamWithPool-8       555782              2056 ns/op            1000 B/op         13 allocs/op
-BenchmarkDecodeJSONStreamWithPool-8       509203              2063 ns/op            1000 B/op         13 allocs/op
-BenchmarkDecodeJSONStreamWithPool-8       541905              2097 ns/op            1000 B/op         13 allocs/op
+BenchmarkEncodeJSON-8                    2344576               502 ns/op             176 B/op          3 allocs/op
+BenchmarkEncodeJSON-8                    2357299               507 ns/op             176 B/op          3 allocs/op
+BenchmarkEncodeJSON-8                    2357732               503 ns/op             176 B/op          3 allocs/op
+BenchmarkEncodeJSON-8                    2345443               509 ns/op             176 B/op          3 allocs/op
+BenchmarkEncodeJSONStream-8              1862427               637 ns/op             256 B/op          5 allocs/op
+BenchmarkEncodeJSONStream-8              1851087               642 ns/op             256 B/op          5 allocs/op
+BenchmarkEncodeJSONStream-8              1848727               639 ns/op             256 B/op          5 allocs/op
+BenchmarkEncodeJSONStream-8              1853800               636 ns/op             256 B/op          5 allocs/op
+BenchmarkEncodeJSONStreamWithPool-8      2063480               580 ns/op             144 B/op          3 allocs/op
+BenchmarkEncodeJSONStreamWithPool-8      2061885               574 ns/op             144 B/op          3 allocs/op
+BenchmarkEncodeJSONStreamWithPool-8      2052324               572 ns/op             144 B/op          3 allocs/op
+BenchmarkEncodeJSONStreamWithPool-8      2086417               577 ns/op             144 B/op          3 allocs/op
+BenchmarkDecodeJSON-8                     574186              1894 ns/op             448 B/op         12 allocs/op
+BenchmarkDecodeJSON-8                     629776              1900 ns/op             448 B/op         12 allocs/op
+BenchmarkDecodeJSON-8                     620904              1904 ns/op             448 B/op         12 allocs/op
+BenchmarkDecodeJSON-8                     566812              1903 ns/op             448 B/op         12 allocs/op
+BenchmarkDecodeJSONWithPool-8             621783              1767 ns/op             312 B/op         10 allocs/op
+BenchmarkDecodeJSONWithPool-8             734518              1753 ns/op             312 B/op         10 allocs/op
+BenchmarkDecodeJSONWithPool-8             705708              1752 ns/op             312 B/op         10 allocs/op
+BenchmarkDecodeJSONWithPool-8             703803              1697 ns/op             312 B/op         10 allocs/op
+BenchmarkDecodeJSONStream-8               516535              2232 ns/op            1136 B/op         15 allocs/op
+BenchmarkDecodeJSONStream-8               471819              2264 ns/op            1136 B/op         15 allocs/op
+BenchmarkDecodeJSONStream-8               480862              2263 ns/op            1136 B/op         15 allocs/op
+BenchmarkDecodeJSONStream-8               451242              2255 ns/op            1136 B/op         15 allocs/op
+BenchmarkDecodeJSONStreamWithPool-8       578415              2035 ns/op            1000 B/op         13 allocs/op
+BenchmarkDecodeJSONStreamWithPool-8       508789              2074 ns/op            1000 B/op         13 allocs/op
+BenchmarkDecodeJSONStreamWithPool-8       548799              2068 ns/op            1000 B/op         13 allocs/op
+BenchmarkDecodeJSONStreamWithPool-8       523879              2075 ns/op            1000 B/op         13 allocs/op
 PASS
-ok      github.com/ludwig125/sync-pool/json     22.339s
+ok      github.com/ludwig125/sync-pool/json     43.694s
 [~/go/src/github.com/ludwig125/sync-pool/json] $
 ```
 
-前述の通り、Streamを扱う`NewDecoder.Decode`は最初にバッファを確保する分、単純な`Unmarshal`に比べて時間もメモリアロケーションも余計にかかるようです。
+前述の通り、Streamを扱う`NewDecoder.Decode`と`NewDecoder.Encode`は最初にバッファを確保する分、単純な`Unmarshal`と`Marshal`に比べて時間もメモリアロケーションも余計にかかるようです。
 
-肝心のsync.Poolを使った場合の改善度合いですが、
+sync.Poolを使った場合の改善度合いですが、以下のような改善度合でした。
+（実行時間 ns/op の数字は４回測ったもののおおよその平均です）
 
-`BenchmarkDecodeJSON`と`BenchmarkDecodeJSONWithPool`、`BenchmarkDecodeJSONStream`と`BenchmarkDecodeJSONStreamWithPool`をそれぞれ比較して、そこまでの改善はありませんでした。
+`BenchmarkEncodeJSONStream` -> `BenchmarkEncodeJSONStreamWithPool`
+
+- 635 ns/op -> 575 ns/op (約10%短縮)
+- 5 allocs/op -> 3 allocs/op
+
+`BenchmarkDecodeJSON` -> `BenchmarkDecodeJSONWithPool`
+
+- 1900 ns/op -> 1700 ns/op (約11%短縮)
+- 12 allocs/op -> 10 allocs/op
+
+`BenchmarkDecodeJSONStream` -> `BenchmarkDecodeJSONStreamWithPool`
+
+- 2250 ns/op -> 2070 ns/op (約8~9%短縮)
+- 15 allocs/op -> 13 allocs/op
+
+
+どの場合も、Poolを使った場合の方が処理速度は向上していました。
+
+JSONの構造体`JsonData`がもう少し複雑だとまた結果が変わってくるかも知れません。
+
+# sync.Poolを使ったgzip圧縮の例
