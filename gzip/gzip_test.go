@@ -156,16 +156,95 @@ var gzipReaderPool = sync.Pool{
 }
 
 func GunzipWithGzipReaderPool(data []byte) ([]byte, error) {
-	b := bytes.NewBuffer(data)
-
 	gr := gzipReaderPool.Get().(*gzipReader)
+	defer gzipReaderPool.Put(gr)
+	defer gr.r.Close()
 	gr.buf.Reset()
-	if err := gr.r.Reset(b); err != nil {
+	if err := gr.r.Reset(bytes.NewBuffer(data)); err != nil {
 		return nil, err
 	}
-	defer gr.r.Close()
 
-	defer gzipReaderPool.Put(gr)
+	d, err := ioutil.ReadAll(gr.r)
+	if err != nil {
+		return nil, fmt.Errorf("failed to ReadAll: %v", err)
+	}
+	if _, err := gr.buf.Write(d); err != nil {
+		return nil, err
+	}
+
+	return gr.buf.Bytes(), nil
+}
+
+type GzipperWithSyncPool struct {
+	GzipWriterPool *sync.Pool
+}
+
+func NewGzipperWithSyncPool() *GzipperWithSyncPool {
+	return &GzipperWithSyncPool{
+		GzipWriterPool: &sync.Pool{
+			New: func() interface{} {
+				buf := &bytes.Buffer{}
+				w := gzip.NewWriter(buf)
+				return &gzipWriter{
+					w:   w,
+					buf: buf,
+				}
+			},
+		},
+	}
+}
+
+func (g *GzipperWithSyncPool) Gzip(data []byte) ([]byte, error) {
+	gw := g.GzipWriterPool.Get().(*gzipWriter)
+	defer g.GzipWriterPool.Put(gw)
+	gw.buf.Reset()
+	gw.w.Reset(gw.buf)
+
+	if _, err := gw.w.Write(data); err != nil {
+		return nil, fmt.Errorf("failed to gzip Write: %v", err)
+	}
+	if err := gw.w.Close(); err != nil {
+		return nil, fmt.Errorf("failed to gzip Close: %v", err)
+	}
+
+	return gw.buf.Bytes(), nil
+}
+
+type GunzipperWithSyncPool struct {
+	GzipReaderPool *sync.Pool
+}
+
+func NewGunzipperWithSyncPool() *GunzipperWithSyncPool {
+	return &GunzipperWithSyncPool{
+		GzipReaderPool: &sync.Pool{
+			New: func() interface{} {
+				var buf bytes.Buffer
+				zw := gzip.NewWriter(&buf)
+				if err := zw.Close(); err != nil {
+					log.Println(err)
+				}
+
+				r, err := gzip.NewReader(&buf)
+				if err != nil {
+					log.Println(err)
+				}
+				return &gzipReader{
+					r:   r,
+					buf: &buf,
+				}
+			},
+		},
+	}
+}
+
+func (g *GunzipperWithSyncPool) Gunzip(data []byte) ([]byte, error) {
+	gr := g.GzipReaderPool.Get().(*gzipReader)
+	defer g.GzipReaderPool.Put(gr)
+	defer gr.r.Close()
+	gr.buf.Reset()
+	if err := gr.r.Reset(bytes.NewBuffer(data)); err != nil {
+		return nil, err
+	}
 
 	d, err := ioutil.ReadAll(gr.r)
 	if err != nil {
@@ -231,6 +310,24 @@ Package gzip implements reading and writing of gzip format compressed files, as 
 			}
 
 			got, err := GunzipWithGzipReaderPool(res)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if string(got) != data {
+				t.Errorf("got: %s, want: %s", string(got), data)
+			}
+		})
+
+		t.Run("GzipperWithSyncPool_GunzipperWithSyncPool", func(t *testing.T) {
+			g := NewGzipperWithSyncPool()
+			res, err := g.Gzip([]byte(data))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			gu := NewGunzipperWithSyncPool()
+			got, err := gu.Gunzip(res)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -311,6 +408,28 @@ func BenchmarkGunzipWithGzipReaderPool(b *testing.B) {
 	var r []byte
 	for n := 0; n < b.N; n++ {
 		r, _ = GunzipWithGzipReaderPool(gzippedData)
+	}
+	Result = r
+}
+
+func BenchmarkGzipperWithSyncPool(b *testing.B) {
+	g := NewGzipperWithSyncPool()
+	b.ResetTimer()
+	b.ReportAllocs()
+	var r []byte
+	for n := 0; n < b.N; n++ {
+		r, _ = g.Gzip([]byte(data))
+	}
+	Result = r
+}
+
+func BenchmarkGunzipperWithSyncPool(b *testing.B) {
+	g := NewGunzipperWithSyncPool()
+	b.ResetTimer()
+	b.ReportAllocs()
+	var r []byte
+	for n := 0; n < b.N; n++ {
+		r, _ = g.Gunzip(gzippedData)
 	}
 	Result = r
 }
