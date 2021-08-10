@@ -24,7 +24,24 @@ func Gzip(data []byte) ([]byte, error) {
 	return b.Bytes(), nil
 }
 
-func Gunzip(data []byte) ([]byte, error) {
+func Gunzip(data io.Reader) ([]byte, error) {
+	gr, err := gzip.NewReader(data)
+	if err != nil {
+		return nil, fmt.Errorf("failed to gzip.NewReader: %v", err)
+	}
+	var buf bytes.Buffer
+	if _, err := io.Copy(&buf, gr); err != nil {
+		return nil, fmt.Errorf("failed to io.Copy: %v", err)
+	}
+	if err := gr.Close(); err != nil {
+		return nil, fmt.Errorf("failed to Close gzip Reader: %v", err)
+	}
+
+	return buf.Bytes(), nil
+}
+
+// 上のGunzipと比べてbytes.NewBuffer(data)の分だけアロケーションが余計にかかる
+func GunzipByteSlice(data []byte) ([]byte, error) {
 	gr, err := gzip.NewReader(bytes.NewBuffer(data))
 	if err != nil {
 		return nil, fmt.Errorf("failed to gzip.NewReader: %v", err)
@@ -40,59 +57,38 @@ func Gunzip(data []byte) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-func Gunzip2(data []byte) ([]byte, error) {
-	gr, err := gzip.NewReader(bytes.NewBuffer(data))
+// 上のGunzipのio.Copyの代わりにioutil.ReadAllを使ってみた場合
+func GunzipIoutilReadAll(data io.Reader) ([]byte, error) {
+	gr, err := gzip.NewReader(data)
 	if err != nil {
 		return nil, fmt.Errorf("failed to gzip.NewReader: %v", err)
 	}
-
-	data, err = ioutil.ReadAll(gr)
+	var buf bytes.Buffer
+	d, err := ioutil.ReadAll(gr)
 	if err != nil {
-		return nil, fmt.Errorf("failed to ReadAll: %v", err)
+		log.Fatalf("failed to ReadAll: %v", err)
 	}
-	buf := &bytes.Buffer{}
-	buf.Write(data)
-	return buf.Bytes(), nil
-}
-
-var pool = &sync.Pool{
-	New: func() interface{} {
-		return &bytes.Buffer{}
-	},
-}
-
-func GzipWithBytesBufferPool(data []byte) ([]byte, error) {
-	buf := pool.Get().(*bytes.Buffer)
-	defer pool.Put(buf)
-	buf.Reset()
-
-	gz := gzip.NewWriter(buf)
-	if _, err := gz.Write(data); err != nil {
-		return nil, fmt.Errorf("failed to gzip Write: %v", err)
-	}
-	if err := gz.Close(); err != nil {
-		return nil, fmt.Errorf("failed to gzip Close: %v", err)
+	buf.Write(d)
+	if err := gr.Close(); err != nil {
+		return nil, fmt.Errorf("failed to Close gzip Reader: %v", err)
 	}
 
 	return buf.Bytes(), nil
 }
 
-func GunzipWithBytesBufferPool(data []byte) ([]byte, error) {
-	gr, err := gzip.NewReader(bytes.NewBuffer(data))
+// 上のGunzipのio.Copyの代わりにbytes.Buffer.ReadFromを使ってみた場合
+func GunzipBufferReadFrom(data io.Reader) ([]byte, error) {
+	gr, err := gzip.NewReader(data)
 	if err != nil {
 		return nil, fmt.Errorf("failed to gzip.NewReader: %v", err)
 	}
-	defer gr.Close()
-
-	buf := pool.Get().(*bytes.Buffer)
-	defer pool.Put(buf)
-	buf.Reset()
-
-	data, err = ioutil.ReadAll(gr)
-	if err != nil {
-		return nil, fmt.Errorf("failed to ReadAll: %v", err)
+	var buf bytes.Buffer
+	if _, err = buf.ReadFrom(gr); err != nil {
+		return nil, err
 	}
-	buf.Write(data)
+	if err := gr.Close(); err != nil {
+		return nil, fmt.Errorf("failed to Close gzip Reader: %v", err)
+	}
 
 	return buf.Bytes(), nil
 }
@@ -132,21 +128,26 @@ func GzipWithGzipWriterPool(data []byte) ([]byte, error) {
 type gzipReader struct {
 	r   *gzip.Reader
 	buf *bytes.Buffer
+	err error
 }
 
 var gzipReaderPool = sync.Pool{
 	New: func() interface{} {
 		var buf bytes.Buffer
-		// 空のbufをgzip.NewReaderで読み込むと unexpected EOF を出すので、
+		// 空のbufをgzip.NewReaderで読み込むと EOF を出すので、
 		// gzip header情報を書き込む
 		zw := gzip.NewWriter(&buf)
 		if err := zw.Close(); err != nil {
-			log.Println(err)
+			return &gzipReader{
+				err: err,
+			}
 		}
 
 		r, err := gzip.NewReader(&buf)
 		if err != nil {
-			log.Println(err)
+			return &gzipReader{
+				err: err,
+			}
 		}
 		return &gzipReader{
 			r:   r,
@@ -155,21 +156,20 @@ var gzipReaderPool = sync.Pool{
 	},
 }
 
-func GunzipWithGzipReaderPool(data []byte) ([]byte, error) {
+func GunzipWithGzipReaderPool(data io.Reader) ([]byte, error) {
 	gr := gzipReaderPool.Get().(*gzipReader)
+	if gr.err != nil {
+		return nil, fmt.Errorf("failed to Get gzipReaderPool: %v", gr.err)
+	}
 	defer gzipReaderPool.Put(gr)
 	defer gr.r.Close()
 	gr.buf.Reset()
-	if err := gr.r.Reset(bytes.NewBuffer(data)); err != nil {
+	if err := gr.r.Reset(data); err != nil {
 		return nil, err
 	}
 
-	d, err := ioutil.ReadAll(gr.r)
-	if err != nil {
-		return nil, fmt.Errorf("failed to ReadAll: %v", err)
-	}
-	if _, err := gr.buf.Write(d); err != nil {
-		return nil, err
+	if _, err := io.Copy(gr.buf, gr.r); err != nil {
+		return nil, fmt.Errorf("failed to io.Copy: %v", err)
 	}
 
 	return gr.buf.Bytes(), nil
@@ -221,12 +221,16 @@ func NewGunzipperWithSyncPool() *GunzipperWithSyncPool {
 				var buf bytes.Buffer
 				zw := gzip.NewWriter(&buf)
 				if err := zw.Close(); err != nil {
-					log.Println(err)
+					return &gzipReader{
+						err: err,
+					}
 				}
 
 				r, err := gzip.NewReader(&buf)
 				if err != nil {
-					log.Println(err)
+					return &gzipReader{
+						err: err,
+					}
 				}
 				return &gzipReader{
 					r:   r,
@@ -237,21 +241,20 @@ func NewGunzipperWithSyncPool() *GunzipperWithSyncPool {
 	}
 }
 
-func (g *GunzipperWithSyncPool) Gunzip(data []byte) ([]byte, error) {
+func (g *GunzipperWithSyncPool) Gunzip(data io.Reader) ([]byte, error) {
 	gr := g.GzipReaderPool.Get().(*gzipReader)
+	if gr.err != nil {
+		return nil, fmt.Errorf("failed to Get gzipReaderPool: %v", gr.err)
+	}
 	defer g.GzipReaderPool.Put(gr)
 	defer gr.r.Close()
 	gr.buf.Reset()
-	if err := gr.r.Reset(bytes.NewBuffer(data)); err != nil {
+	if err := gr.r.Reset(data); err != nil {
 		return nil, err
 	}
 
-	d, err := ioutil.ReadAll(gr.r)
-	if err != nil {
-		return nil, fmt.Errorf("failed to ReadAll: %v", err)
-	}
-	if _, err := gr.buf.Write(d); err != nil {
-		return nil, err
+	if _, err := io.Copy(gr.buf, gr.r); err != nil {
+		return nil, fmt.Errorf("failed to io.Copy: %v", err)
 	}
 
 	return gr.buf.Bytes(), nil
@@ -263,59 +266,61 @@ Documentation
 Overview
 Package gzip implements reading and writing of gzip format compressed files, as specified in RFC 1952.`
 
+	t.Run("Gzip_and_Gunzip", func(t *testing.T) {
+		res, err := Gzip([]byte(data))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		got, err := Gunzip(bytes.NewBuffer(res))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != data {
+			t.Errorf("got: %s, want: %s", string(got), data)
+		}
+
+		got2, err := GunzipByteSlice(res)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got2) != data {
+			t.Errorf("got2: %s, want: %s", string(got2), data)
+		}
+
+		got3, err := GunzipIoutilReadAll(bytes.NewBuffer(res))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got3) != data {
+			t.Errorf("got3: %s, want: %s", string(got3), data)
+		}
+
+		got4, err := GunzipBufferReadFrom(bytes.NewBuffer(res))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got4) != data {
+			t.Errorf("got4: %s, want: %s", string(got4), data)
+		}
+	})
+
 	// Poolを正しく使わないと前にPutした値をGetで取ってきてしまうミスがあり得る
 	// そのため、２回実行しても同じ結果であることを確認している
 	for i := 0; i < 3; i++ {
-		t.Run("Gzip_and_Gunzip", func(t *testing.T) {
-			res, err := Gzip([]byte(data))
-			if err != nil {
-				t.Fatal(err)
-			}
-			got, err := Gunzip(res)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if string(got) != data {
-				t.Errorf("got: %s, want: %s", string(got), data)
-			}
-
-			got2, err := Gunzip2(res)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if string(got2) != data {
-				t.Errorf("got2: %s, want: %s", string(got2), data)
-			}
-		})
-
-		t.Run("GzipWithBytesBufferPool_GunzipWithGzipReaderPool", func(t *testing.T) {
-			res, err := GzipWithBytesBufferPool([]byte(data))
-			if err != nil {
-				t.Fatal(err)
-			}
-			got, err := GunzipWithBytesBufferPool(res)
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			if string(got) != data {
-				t.Errorf("got: %s, want: %s", string(got), data)
-			}
-		})
-
 		t.Run("GzipWithGzipWriterPool_GunzipWithGzipReaderPool", func(t *testing.T) {
 			res, err := GzipWithGzipWriterPool([]byte(data))
 			if err != nil {
 				t.Fatal(err)
 			}
 
-			got, err := GunzipWithGzipReaderPool(res)
+			res2, err := GunzipWithGzipReaderPool(bytes.NewBuffer(res))
 			if err != nil {
 				t.Fatal(err)
 			}
 
-			if string(got) != data {
-				t.Errorf("got: %s, want: %s", string(got), data)
+			if string(res2) != data {
+				t.Errorf("got: %s, want: %s", string(res2), data)
 			}
 		})
 
@@ -327,13 +332,13 @@ Package gzip implements reading and writing of gzip format compressed files, as 
 			}
 
 			gu := NewGunzipperWithSyncPool()
-			got, err := gu.Gunzip(res)
+			res2, err := gu.Gunzip(bytes.NewBuffer(res))
 			if err != nil {
 				t.Fatal(err)
 			}
 
-			if string(got) != data {
-				t.Errorf("got: %s, want: %s", string(got), data)
+			if string(res2) != data {
+				t.Errorf("got: %s, want: %s", string(res2), data)
 			}
 		})
 	}
@@ -346,7 +351,8 @@ var (
 	Overview
 	Package gzip implements reading and writing of gzip format compressed files, as specified in RFC 1952.`
 
-	gzippedData, _ = Gzip([]byte(data))
+	gzippedData, _    = Gzip([]byte(data))
+	gzippedDataStream = bytes.NewBuffer(gzippedData)
 )
 
 func BenchmarkGzip(b *testing.B) {
@@ -358,56 +364,11 @@ func BenchmarkGzip(b *testing.B) {
 	Result = r
 }
 
-func BenchmarkGzipWithBytesBufferPool(b *testing.B) {
-	b.ReportAllocs()
-	var r []byte
-	for n := 0; n < b.N; n++ {
-		r, _ = GzipWithBytesBufferPool([]byte(data))
-	}
-	Result = r
-}
-
 func BenchmarkGzipWithGzipWriterPool(b *testing.B) {
 	b.ReportAllocs()
 	var r []byte
 	for n := 0; n < b.N; n++ {
 		r, _ = GzipWithGzipWriterPool([]byte(data))
-	}
-	Result = r
-}
-
-func BenchmarkGunzip(b *testing.B) {
-	b.ReportAllocs()
-	var r []byte
-	for n := 0; n < b.N; n++ {
-		r, _ = Gunzip(gzippedData)
-	}
-	Result = r
-}
-
-func BenchmarkGunzip2(b *testing.B) {
-	b.ReportAllocs()
-	var r []byte
-	for n := 0; n < b.N; n++ {
-		r, _ = Gunzip2(gzippedData)
-	}
-	Result = r
-}
-
-func BenchmarkGunzipWithBytesBufferPool(b *testing.B) {
-	b.ReportAllocs()
-	var r []byte
-	for n := 0; n < b.N; n++ {
-		r, _ = GunzipWithBytesBufferPool(gzippedData)
-	}
-	Result = r
-}
-
-func BenchmarkGunzipWithGzipReaderPool(b *testing.B) {
-	b.ReportAllocs()
-	var r []byte
-	for n := 0; n < b.N; n++ {
-		r, _ = GunzipWithGzipReaderPool(gzippedData)
 	}
 	Result = r
 }
@@ -423,13 +384,58 @@ func BenchmarkGzipperWithSyncPool(b *testing.B) {
 	Result = r
 }
 
+func BenchmarkGunzip(b *testing.B) {
+	b.ReportAllocs()
+	var r []byte
+	for n := 0; n < b.N; n++ {
+		r, _ = Gunzip(gzippedDataStream)
+	}
+	Result = r
+}
+
+func BenchmarkGunzipByteSlice(b *testing.B) {
+	b.ReportAllocs()
+	var r []byte
+	for n := 0; n < b.N; n++ {
+		r, _ = GunzipByteSlice(gzippedData)
+	}
+	Result = r
+}
+
+func BenchmarkGunzipIoutilReadAll(b *testing.B) {
+	b.ReportAllocs()
+	var r []byte
+	for n := 0; n < b.N; n++ {
+		r, _ = GunzipIoutilReadAll(gzippedDataStream)
+	}
+	Result = r
+}
+
+func BenchmarkGunzipBufferReadFrom(b *testing.B) {
+	b.ReportAllocs()
+	var r []byte
+	for n := 0; n < b.N; n++ {
+		r, _ = GunzipBufferReadFrom(gzippedDataStream)
+	}
+	Result = r
+}
+
+func BenchmarkGunzipWithGzipReaderPool(b *testing.B) {
+	b.ReportAllocs()
+	var r []byte
+	for n := 0; n < b.N; n++ {
+		r, _ = GunzipWithGzipReaderPool(gzippedDataStream)
+	}
+	Result = r
+}
+
 func BenchmarkGunzipperWithSyncPool(b *testing.B) {
 	g := NewGunzipperWithSyncPool()
 	b.ResetTimer()
 	b.ReportAllocs()
 	var r []byte
 	for n := 0; n < b.N; n++ {
-		r, _ = g.Gunzip(gzippedData)
+		r, _ = g.Gunzip(gzippedDataStream)
 	}
 	Result = r
 }

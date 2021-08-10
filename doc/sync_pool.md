@@ -1901,3 +1901,701 @@ sync.Poolを使った場合の改善度合いですが、以下のような改�
 JSONの構造体`JsonData`がもう少し複雑だとまた結果が変わってくるかも知れません。
 
 # sync.Poolを使ったgzip圧縮の例
+
+同様にgzipについてもsync.Poolを使ってみます。
+
+gzipの場合はきちんとしようとすると少し複雑になりました。
+
+
+## 通常のGzip,Gunzip
+
+まずは普通のgzipの圧縮(compress)と展開(uncompress)を見てみます。
+
+公式ドキュメントのExampleを参考にします。
+
+https://pkg.go.dev/compress/gzip
+
+- https://play.golang.org/p/6-JkiioFPrl
+
+公式のExample内の圧縮と展開部分をそれぞれ関数に分けて以下のようにしました。
+
+```golang
+func Gzip(data []byte) ([]byte, error) {
+	var b bytes.Buffer
+	gw := gzip.NewWriter(&b)
+	if _, err := gw.Write(data); err != nil {
+		return nil, fmt.Errorf("failed to gzip Write: %v", err)
+	}
+	if err := gw.Close(); err != nil {
+		return nil, fmt.Errorf("failed to Close gzip Writer: %v", err)
+	}
+
+	return b.Bytes(), nil
+}
+
+func Gunzip(data io.Reader) ([]byte, error) {
+	gr, err := gzip.NewReader(data)
+	if err != nil {
+		return nil, fmt.Errorf("failed to gzip.NewReader: %v", err)
+	}
+	var buf bytes.Buffer
+	if _, err := io.Copy(&buf, gr); err != nil {
+		return nil, fmt.Errorf("failed to io.Copy: %v", err)
+	}
+	if err := gr.Close(); err != nil {
+		return nil, fmt.Errorf("failed to Close gzip Reader: %v", err)
+	}
+
+	return buf.Bytes(), nil
+}
+```
+
+このgzipのコードでは、圧縮を `Gzip`、展開を`Gunzip`という名称にしています。
+
+`Gunzip` 関数はちょっと工夫していて、引数を`io.Reader`にしています。
+
+HTTPリクエストの結果を展開するような場合を考えると、Streamデータをそのまま受け取って展開するほうが効率がいいのでこのようにしています。
+
+もし`Gunzip`も`Gzip`と同様に `[]byte` でやり取りするほうが使い勝手がいい、という場合は、以下のようにも書けます。
+
+ただし、これだと上に挙げたようなStreamデータを扱う場合には、一旦Byte列に直してからまたStreamにしているので余計な処理がかかり効率は悪くなります。
+
+```golang
+// 上のGunzipと比べてbytes.NewBuffer(data)の分だけアロケーションが余計にかかる
+func GunzipByteSlice(data []byte) ([]byte, error) {
+	gr, err := gzip.NewReader(bytes.NewBuffer(data))
+	if err != nil {
+		return nil, fmt.Errorf("failed to gzip.NewReader: %v", err)
+	}
+	var buf bytes.Buffer
+	if _, err := io.Copy(&buf, gr); err != nil {
+		return nil, fmt.Errorf("failed to io.Copy: %v", err)
+	}
+	if err := gr.Close(); err != nil {
+		return nil, fmt.Errorf("failed to Close gzip Reader: %v", err)
+	}
+
+	return buf.Bytes(), nil
+}
+```
+
+また、Gunzipの際に、`io.Copy`ではなく`ioutil.ReadAll`や`bytes.Buffer.ReadFrom`を使っている場合もよく見るので、合わせて書いておきます。
+
+```golang
+// 上のGunzipのio.Copyの代わりにioutil.ReadAllを使ってみた場合
+func GunzipIoutilReadAll(data io.Reader) ([]byte, error) {
+	gr, err := gzip.NewReader(data)
+	if err != nil {
+		return nil, fmt.Errorf("failed to gzip.NewReader: %v", err)
+	}
+	var buf bytes.Buffer
+	d, err := ioutil.ReadAll(gr)
+	if err != nil {
+		log.Fatalf("failed to ReadAll: %v", err)
+	}
+	buf.Write(d)
+	if err := gr.Close(); err != nil {
+		return nil, fmt.Errorf("failed to Close gzip Reader: %v", err)
+	}
+
+	return buf.Bytes(), nil
+}
+
+// 上のGunzipのio.Copyの代わりにbytes.Buffer.ReadFromを使ってみた場合
+func GunzipBufferReadFrom(data io.Reader) ([]byte, error) {
+	gr, err := gzip.NewReader(data)
+	if err != nil {
+		return nil, fmt.Errorf("failed to gzip.NewReader: %v", err)
+	}
+	var buf bytes.Buffer
+	if _, err = buf.ReadFrom(gr); err != nil {
+		return nil, err
+	}
+	if err := gr.Close(); err != nil {
+		return nil, fmt.Errorf("failed to Close gzip Reader: %v", err)
+	}
+
+	return buf.Bytes(), nil
+}
+```
+
+ただ、io.Copyの方がシンプルなので、この後のsync.Poolを使った改良ではio.CopyのGunzipを改良していきます。
+
+上のコードのBenchmark結果は以下の通りです。
+
+- dataは何でもいいので https://pkg.go.dev/compress/gzip のOverviewに書いてあった文字列を使用しています
+- Gunzipに読み込ませるデータは、dataをGzipの結果を使っています
+
+```golang
+var (
+	Result []byte
+	data   = `https://pkg.go.dev/compress/gzip
+	Documentation
+	Overview
+	Package gzip implements reading and writing of gzip format compressed files, as specified in RFC 1952.`
+
+	gzippedData, _    = Gzip([]byte(data))
+	gzippedDataStream = bytes.NewBuffer(gzippedData)
+)
+
+func BenchmarkGzip(b *testing.B) {
+	b.ReportAllocs()
+	var r []byte
+	for n := 0; n < b.N; n++ {
+		r, _ = Gzip([]byte(data))
+	}
+	Result = r
+}
+
+func BenchmarkGunzip(b *testing.B) {
+	b.ReportAllocs()
+	var r []byte
+	for n := 0; n < b.N; n++ {
+		r, _ = Gunzip(gzippedDataStream)
+	}
+	Result = r
+}
+
+func BenchmarkGunzipByteSlice(b *testing.B) {
+	b.ReportAllocs()
+	var r []byte
+	for n := 0; n < b.N; n++ {
+		r, _ = GunzipByteSlice(gzippedData)
+	}
+	Result = r
+}
+
+func BenchmarkGunzipIoutilReadAll(b *testing.B) {
+	b.ReportAllocs()
+	var r []byte
+	for n := 0; n < b.N; n++ {
+		r, _ = GunzipIoutilReadAll(gzippedDataStream)
+	}
+	Result = r
+}
+
+func BenchmarkGunzipBufferReadFrom(b *testing.B) {
+	b.ReportAllocs()
+	var r []byte
+	for n := 0; n < b.N; n++ {
+		r, _ = GunzipBufferReadFrom(gzippedDataStream)
+	}
+	Result = r
+}
+```
+
+Benchmark実行結果
+
+```
+[~/go/src/github.com/ludwig125/sync-pool/gzip] $go test -bench . -count=1
+goos: linux
+goarch: amd64
+pkg: github.com/ludwig125/sync-pool/gzip
+BenchmarkGzip-8                             5364            212350 ns/op          815139 B/op         21 allocs/op
+BenchmarkGunzip-8                        2075224               564 ns/op             752 B/op          3 allocs/op
+BenchmarkGunzipByteSlice-8                 56433             19400 ns/op           43328 B/op          9 allocs/op
+BenchmarkGunzipIoutilReadAll-8           2078530               600 ns/op             752 B/op          3 allocs/op
+BenchmarkGunzipBufferReadFrom-8          2012518               568 ns/op             752 B/op          3 allocs/op
+PASS
+ok      github.com/ludwig125/sync-pool/gzip     13.429s
+```
+
+Gunzipの方は４種類測った結果、やはり一旦`[]byte`に直している`GunzipByteSlice`が遅いことが分かりました。それ以外のGunzipの性能は変わらないようです。
+
+## sync.Poolを使ったGzip
+
+上記のGzip, Gunzipをsync.Poolを使って効率化しようとする場合どうすればいいでしょうか？
+
+どちらも`bytes.Buffer`を扱っているので、これをPoolの対象にすればいいでしょうか？
+```golang
+// こういうPoolでいい？
+var pool = &sync.Pool{
+	New: func() interface{} {
+		return &bytes.Buffer{}
+	},
+}
+```
+
+しかし関数をよく見てみると、`gzip.NewWriter`と`gzip.NewReader`の`New～`に気づきます。
+
+もしこの`New～`が使われる回数をsync.Poolで減らすことができたら性能改善に繋がるかもしれません。
+
+そこでまずは以下のようにGzip関数を改良してみました。
+
+```golang
+type gzipWriter struct {
+	w   *gzip.Writer
+	buf *bytes.Buffer
+}
+
+var gzipWriterPool = sync.Pool{
+	New: func() interface{} {
+		buf := &bytes.Buffer{}
+		w := gzip.NewWriter(buf)
+		return &gzipWriter{
+			w:   w,
+			buf: buf,
+		}
+	},
+}
+
+func GzipWithGzipWriterPool(data []byte) ([]byte, error) {
+	gw := gzipWriterPool.Get().(*gzipWriter)
+	defer gzipWriterPool.Put(gw)
+	gw.buf.Reset()
+	gw.w.Reset(gw.buf)
+
+	if _, err := gw.w.Write(data); err != nil {
+		return nil, fmt.Errorf("failed to gzip Write: %v", err)
+	}
+	if err := gw.w.Close(); err != nil {
+		return nil, fmt.Errorf("failed to gzip Close: %v", err)
+	}
+
+	return gw.buf.Bytes(), nil
+}
+```
+
+`gzipWriter`という構造体を定義して、この中に`*gzip.Writer`と`*bytes.Buffer`を持たせてみました。
+呼び出した先で中身を書き換えられるようにポインタにしています。
+
+さらに、`gzipWriterPool`というPoolを定義して、このNew関数でbufferの作成とNewWriterもするようにしました。
+
+`GzipWithGzipWriterPool`関数では、`gzipWriter`をPoolから取得したあとに、bufとWriter両方をResetしているところが注意点です。
+
+もし`GzipWithGzipWriterPool`関数を複数回実行した場合、Poolにはその前にPutした値が格納されたままなので、このResetをしないと前のデータと混在して予期しない結果になってしまいます。
+
+
+```golang
+gw := gzipWriterPool.Get().(*gzipWriter)
+defer gzipWriterPool.Put(gw)
+gw.buf.Reset()
+gw.w.Reset(gw.buf)
+```
+
+## sync.Poolを使ったGunzip
+
+Gzipと同様にGunzipも考えます。
+こちらはもうひと手間必要です。
+
+```golang
+type gzipReader struct {
+	r   *gzip.Reader
+	buf *bytes.Buffer
+	err error
+}
+
+var gzipReaderPool = sync.Pool{
+	New: func() interface{} {
+		var buf bytes.Buffer
+		// 空のbufをgzip.NewReaderで読み込むと EOF を出すので、
+		// gzip header情報を書き込む
+		zw := gzip.NewWriter(&buf)
+		if err := zw.Close(); err != nil {
+			return &gzipReader{
+				err: err,
+			}
+		}
+
+		r, err := gzip.NewReader(&buf)
+		if err != nil {
+			return &gzipReader{
+				err: err,
+			}
+		}
+		return &gzipReader{
+			r:   r,
+			buf: &buf,
+		}
+	},
+}
+
+func GunzipWithGzipReaderPool(data io.Reader) ([]byte, error) {
+	gr := gzipReaderPool.Get().(*gzipReader)
+	if gr.err != nil {
+		return nil, fmt.Errorf("failed to Get gzipReaderPool: %v", gr.err)
+	}
+	defer gzipReaderPool.Put(gr)
+	defer gr.r.Close()
+	gr.buf.Reset()
+	if err := gr.r.Reset(data); err != nil {
+		return nil, err
+	}
+
+	if _, err := io.Copy(gr.buf, gr.r); err != nil {
+		return nil, fmt.Errorf("failed to io.Copy: %v", err)
+	}
+
+	return gr.buf.Bytes(), nil
+}
+```
+
+`gzipReader`という構造体を定義しているところは`GzipWithGzipWriterPool`と同様ですが、
+変数に`err`を追加しています。
+
+`gzipReaderPool`では、bufを使って一旦`gzip.NewWriter`を呼び出してからCloseしています。
+
+これは、空のbufを`gzip.NewReader`で読み込むと、bufにgzip header情報がないので、`EOF`のエラーを出すためです。
+
+完全に追えていませんが、おそらく以下の`readHeader`関数内の処理で出しています。
+- https://github.com/golang/go/blob/507cc341ec2cb96b0199800245f222146f799266/src/compress/gzip/gunzip.go#L174
+
+
+
+これらの`gzip.NewWriter`のCloseと`gzip.NewReader`で発生しうるエラーをNew関数が呼ばれた際に `gzipReader` に詰めて、
+PoolからのGet直後にエラーハンドリングを追加しました。
+
+Gzipと同様にbufとgzip.ReaderのResetをしていますが、gzip.ReaderはdataでResetしています。
+
+
+## sync.Poolを構造体の変数に入れた場合のGzip、Gunzip
+
+ここまでsync.Pool変数をグローバル変数として扱ってきましたが、
+構造体のフィールド変数として使うとしたらどんな感じになるだろうと気になって、試しにその場合も考えてみます。
+
+以下のようになりました。
+
+```golang
+type GzipperWithSyncPool struct {
+	GzipWriterPool *sync.Pool
+}
+
+func NewGzipperWithSyncPool() *GzipperWithSyncPool {
+	return &GzipperWithSyncPool{
+		GzipWriterPool: &sync.Pool{
+			New: func() interface{} {
+				buf := &bytes.Buffer{}
+				w := gzip.NewWriter(buf)
+				return &gzipWriter{
+					w:   w,
+					buf: buf,
+				}
+			},
+		},
+	}
+}
+
+func (g *GzipperWithSyncPool) Gzip(data []byte) ([]byte, error) {
+	gw := g.GzipWriterPool.Get().(*gzipWriter)
+	defer g.GzipWriterPool.Put(gw)
+	gw.buf.Reset()
+	gw.w.Reset(gw.buf)
+
+	if _, err := gw.w.Write(data); err != nil {
+		return nil, fmt.Errorf("failed to gzip Write: %v", err)
+	}
+	if err := gw.w.Close(); err != nil {
+		return nil, fmt.Errorf("failed to gzip Close: %v", err)
+	}
+
+	return gw.buf.Bytes(), nil
+}
+
+type GunzipperWithSyncPool struct {
+	GzipReaderPool *sync.Pool
+}
+
+func NewGunzipperWithSyncPool() *GunzipperWithSyncPool {
+	return &GunzipperWithSyncPool{
+		GzipReaderPool: &sync.Pool{
+			New: func() interface{} {
+				var buf bytes.Buffer
+				zw := gzip.NewWriter(&buf)
+				if err := zw.Close(); err != nil {
+					return &gzipReader{
+						err: err,
+					}
+				}
+
+				r, err := gzip.NewReader(&buf)
+				if err != nil {
+					return &gzipReader{
+						err: err,
+					}
+				}
+				return &gzipReader{
+					r:   r,
+					buf: &buf,
+				}
+			},
+		},
+	}
+}
+
+func (g *GunzipperWithSyncPool) Gunzip(data io.Reader) ([]byte, error) {
+	gr := g.GzipReaderPool.Get().(*gzipReader)
+	if gr.err != nil {
+		return nil, fmt.Errorf("failed to Get gzipReaderPool: %v", gr.err)
+	}
+	defer g.GzipReaderPool.Put(gr)
+	defer gr.r.Close()
+	gr.buf.Reset()
+	if err := gr.r.Reset(data); err != nil {
+		return nil, err
+	}
+
+	if _, err := io.Copy(gr.buf, gr.r); err != nil {
+		return nil, fmt.Errorf("failed to io.Copy: %v", err)
+	}
+
+	return gr.buf.Bytes(), nil
+}
+```
+
+## Gzip, GunzipのBenchmark比較
+
+上記の関数のBenchmark取った結果は以下の通りです。
+
+```golang
+
+var (
+	Result []byte
+	data   = `https://pkg.go.dev/compress/gzip
+	Documentation
+	Overview
+	Package gzip implements reading and writing of gzip format compressed files, as specified in RFC 1952.`
+
+	gzippedData, _    = Gzip([]byte(data))
+	gzippedDataStream = bytes.NewBuffer(gzippedData)
+)
+
+func BenchmarkGzip(b *testing.B) {
+	b.ReportAllocs()
+	var r []byte
+	for n := 0; n < b.N; n++ {
+		r, _ = Gzip([]byte(data))
+	}
+	Result = r
+}
+
+func BenchmarkGzipWithGzipWriterPool(b *testing.B) {
+	b.ReportAllocs()
+	var r []byte
+	for n := 0; n < b.N; n++ {
+		r, _ = GzipWithGzipWriterPool([]byte(data))
+	}
+	Result = r
+}
+
+func BenchmarkGzipperWithSyncPool(b *testing.B) {
+	g := NewGzipperWithSyncPool()
+	b.ResetTimer()
+	b.ReportAllocs()
+	var r []byte
+	for n := 0; n < b.N; n++ {
+		r, _ = g.Gzip([]byte(data))
+	}
+	Result = r
+}
+
+func BenchmarkGunzip(b *testing.B) {
+	b.ReportAllocs()
+	var r []byte
+	for n := 0; n < b.N; n++ {
+		r, _ = Gunzip(gzippedDataStream)
+	}
+	Result = r
+}
+
+func BenchmarkGunzipByteSlice(b *testing.B) {
+	b.ReportAllocs()
+	var r []byte
+	for n := 0; n < b.N; n++ {
+		r, _ = GunzipByteSlice(gzippedData)
+	}
+	Result = r
+}
+
+func BenchmarkGunzipIoutilReadAll(b *testing.B) {
+	b.ReportAllocs()
+	var r []byte
+	for n := 0; n < b.N; n++ {
+		r, _ = GunzipIoutilReadAll(gzippedDataStream)
+	}
+	Result = r
+}
+
+func BenchmarkGunzipBufferReadFrom(b *testing.B) {
+	b.ReportAllocs()
+	var r []byte
+	for n := 0; n < b.N; n++ {
+		r, _ = GunzipBufferReadFrom(gzippedDataStream)
+	}
+	Result = r
+}
+
+func BenchmarkGunzipWithGzipReaderPool(b *testing.B) {
+	b.ReportAllocs()
+	var r []byte
+	for n := 0; n < b.N; n++ {
+		r, _ = GunzipWithGzipReaderPool(gzippedDataStream)
+	}
+	Result = r
+}
+
+func BenchmarkGunzipperWithSyncPool(b *testing.B) {
+	g := NewGunzipperWithSyncPool()
+	b.ResetTimer()
+	b.ReportAllocs()
+	var r []byte
+	for n := 0; n < b.N; n++ {
+		r, _ = g.Gunzip(gzippedDataStream)
+	}
+	Result = r
+}
+```
+
+実行結果
+
+```
+[~/go/src/github.com/ludwig125/sync-pool/gzip] $go test gzip_test.go -bench . -count=1
+goos: linux
+goarch: amd64
+BenchmarkGzip-8                             5750            199275 ns/op          814449 B/op         21 allocs/op
+BenchmarkGzipWithGzipWriterPool-8          40617             28469 ns/op             196 B/op          1 allocs/op
+BenchmarkGzipperWithSyncPool-8             40939             28528 ns/op             195 B/op          1 allocs/op
+BenchmarkGunzip-8                        2002453               582 ns/op             752 B/op          3 allocs/op
+BenchmarkGunzipByteSlice-8                 75648             15390 ns/op           41792 B/op          8 allocs/op
+BenchmarkGunzipIoutilReadAll-8           2018872               588 ns/op             752 B/op          3 allocs/op
+BenchmarkGunzipBufferReadFrom-8          2002993               583 ns/op             752 B/op          3 allocs/op
+BenchmarkGunzipWithGzipReaderPool-8     11872970                96.8 ns/op             0 B/op          0 allocs/op
+BenchmarkGunzipperWithSyncPool-8        11647917                94.1 ns/op             0 B/op          0 allocs/op
+PASS
+ok      command-line-arguments  14.097s
+```
+
+Gzipについて
+
+- 通常の`Gzip`のメモリアロケーション回数が21なのに対して、sync.Poolを使った`GzipWithGzipWriterPool`, `GzipperWithSyncPool`では1になりました。同時に処理速度も改善しています
+
+Gunzipについて
+
+- 通常の`Gunzip`に比べて、引数を `[]byte`にした`GunzipByteSlice`はやはり効率が悪いことが分かります。（`GunzipIoutilReadAll`と`GunzipBufferReadFrom`は`Gunzip`と変わらないようです）
+- sync.Poolを使った`GunzipWithGzipReaderPool`, `GunzipperWithSyncPool`ではメモリアロケーションが０になりました。当然処理速度も改善しています
+
+sync.Pool変数をグローバル変数とした場合、構造体変数とした場合
+
+- ２つの場合の性能は同じにできたので、状況に応じて好きなほうを使うことができそうです
+
+
+## 【おまけ】gzipのHeaderの確認
+
+Gunzipのsync.Pool対応のところで書いた、gzipのHeaderについて書きます。
+
+突然ですが、このコードを実行してみます。
+
+```golang
+package main
+
+import (
+	"bytes"
+	"compress/gzip"
+	"log"
+	"os"
+)
+
+func main() {
+	file, err := os.Create("file.gz")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	zw := gzip.NewWriter(file)
+	if err := zw.Close(); err != nil {
+		log.Fatal(err)
+	}
+
+	if _, err := gzip.NewReader(file); err != nil {
+		log.Printf("gzip.NewReader file: %v", err)
+	}
+	file.Close() // CloseするとHeader情報が書き込まれて閉じられる
+
+	// 同じファイルをfile2として開きなおす
+	file2, err := os.Open("file.gz")
+	if err != nil {
+		log.Fatal(err)
+	}
+	// fileにはHeader情報があるので、gzip.NewReaderでエラーは発生しない
+	if _, err := gzip.NewReader(file2); err != nil {
+		log.Fatalf("gzip.NewReader file2: %v", err)
+	}
+	file2.Close()
+
+	var buf bytes.Buffer
+	if _, err := gzip.NewReader(&buf); err != nil {
+		log.Printf("gzip.NewReader bytes.Buffer: %v", err)
+	}
+}
+```
+
+実行結果
+
+```
+[~/go/src/github.com/ludwig125/sync-pool/gzip] $go run gzip.go
+2021/08/11 06:12:13 gzip.NewReader file: EOF
+2021/08/11 06:12:13 gzip.NewReader bytes.Buffer: EOF
+```
+
+`file.Close()`の前に行った`gzip.NewReader file`では `EOF`のエラーが返ってきたことが確認できました。
+
+以下のGo公式のコードを見ると分かる通り、
+
+> // Callers that wish to set the fields in Writer.Header must do so before
+> // the first call to Write, Flush, or Close.
+
+Writer.Header を書き込みたければ Write, Flush, or Closeをする前にしておく必要があります。
+=> Write, Flush, or CloseをするとwroteHeader フラグがTrueになって Writer.Header が書き込まれます。
+
+https://github.com/golang/go/blob/master/src/compress/gzip/gzip.go
+
+```golang
+// NewWriter returns a new Writer.
+// Writes to the returned writer are compressed and written to w.
+//
+// It is the caller's responsibility to call Close on the Writer when done.
+// Writes may be buffered and not flushed until Close.
+//
+// Callers that wish to set the fields in Writer.Header must do so before
+// the first call to Write, Flush, or Close.
+func NewWriter(w io.Writer) *Writer {
+	z, _ := NewWriterLevel(w, DefaultCompression)
+	return z
+}
+```
+
+`file.Close()`をするとgzipのHeader情報が書き込まれるので、次に同じファイルを開いたときは`EOF`のエラーは出ていません。
+（gzip.NewReader file2 は出ていません）
+
+
+`gzip.NewReader`時にHeader情報がないと`EOF`が出るのは、空の`bytes.Buffer`を読み込んだ時も同じです。
+（gzip.NewReader bytes.Buffer が出ています）
+
+Gunzipをsync.Poolで効率化しようとしたときに考慮したエラーはこのエラーのことでした。
+
+
+最後に、コードの実行の結果作られたファイルを見てみます。
+
+```
+[~/go/src/github.com/ludwig125/sync-pool/gzip] $ls -l file.gz
+-rw-r--r-- 1 ludwig125 ludwig125 23  8月 11 06:12 file.gz
+[~/go/src/github.com/ludwig125/sync-pool/gzip] $
+[~/go/src/github.com/ludwig125/sync-pool/gzip] $cat file.gz
+���%
+[~/go/src/github.com/ludwig125/sync-pool/gzip]
+```
+
+普通にcatしても分からないので、hexdumpで見てみると以下の通りです。
+
+```
+[~/go/src/github.com/ludwig125/sync-pool/gzip] $hexdump -C file.gz
+00000000  1f 8b 08 00 00 00 00 00  00 ff 01 00 00 ff ff 00  |................|
+00000010  00 00 00 00 00 00 00                              |.......|
+00000017
+[~/go/src/github.com/ludwig125/sync-pool/gzip] $
+```
+
+この`1f`,`8b`などがgzipのHeader情報です。
+
+Header情報については以下のページがとても詳しくて助かりました。
+
+https://blog.8tak4.com/post/169064070956/principle-of-gzip-golang
