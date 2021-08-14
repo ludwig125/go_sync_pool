@@ -2599,3 +2599,13 @@ Gunzipをsync.Poolで効率化しようとしたときに考慮したエラー�
 Header情報については以下のページがとても詳しくて助かりました。
 
 https://blog.8tak4.com/post/169064070956/principle-of-gzip-golang
+
+#### その他参考
+
+http://robertxchen.site:3000/forks/MiraiGo/commit/192b8c562ffd50ab3b89e026da8110250b9019d3
+
+https://gitlab.com/gitlab-org/gitlab-runner/-/blob/96aab6bc6f64e767c06e356107e1dc848518db0f/vendor/github.com/emicklei/go-restful/compressor_pools.go
+
+
+
+#

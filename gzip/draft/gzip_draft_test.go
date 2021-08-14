@@ -9,6 +9,19 @@ import (
 	"testing"
 )
 
+func Gzip(data []byte) ([]byte, error) {
+	var b bytes.Buffer
+	gw := gzip.NewWriter(&b)
+	if _, err := gw.Write(data); err != nil {
+		return nil, fmt.Errorf("failed to gzip Write: %v", err)
+	}
+	if err := gw.Close(); err != nil {
+		return nil, fmt.Errorf("failed to Close gzip Writer: %v", err)
+	}
+
+	return b.Bytes(), nil
+}
+
 func Gunzip3(data []byte) ([]byte, error) {
 	gr, err := gzip.NewReader(bytes.NewBuffer(data))
 	if err != nil {
@@ -87,6 +100,15 @@ func GunzipWithBytesBufferPool(data []byte) ([]byte, error) {
 // 	return buf.Bytes(), nil
 // }
 
+type gzipReader struct {
+	r   *gzip.Reader
+	buf *bytes.Buffer
+}
+
+type GunzipperWithSyncPool struct {
+	GzipReaderPool *sync.Pool
+}
+
 func (g *GunzipperWithSyncPool) Gunzip2(data []byte) ([]byte, error) {
 	gr := g.GzipReaderPool.Get().(*gzipReader)
 	defer g.GzipReaderPool.Put(gr)
@@ -147,6 +169,16 @@ Package gzip implements reading and writing of gzip format compressed files, as 
 		})
 	}
 }
+
+var (
+	Result []byte
+	data   = `https://pkg.go.dev/compress/gzip
+Documentation
+Overview
+Package gzip implements reading and writing of gzip format compressed files, as specified in RFC 1952.`
+
+	gzippedData, _ = Gzip([]byte(data))
+)
 
 func BenchmarkGzipWithBytesBufferPool(b *testing.B) {
 	b.ReportAllocs()

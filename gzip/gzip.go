@@ -13,7 +13,6 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// fileにgzip Headerを書き込み(FlushもCloseもしていないと書き込みは完了していない)
 	zw := gzip.NewWriter(file)
 	if err := zw.Close(); err != nil {
 		log.Fatal(err)
@@ -30,11 +29,11 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer file2.Close()
 	// fileにはHeader情報があるので、gzip.NewReaderでエラーは発生しない
 	if _, err := gzip.NewReader(file2); err != nil {
 		log.Fatalf("gzip.NewReader file2: %v", err)
 	}
+	file2.Close()
 
 	var buf bytes.Buffer
 	if _, err := gzip.NewReader(&buf); err != nil {
