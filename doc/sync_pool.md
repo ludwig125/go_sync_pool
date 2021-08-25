@@ -37,14 +37,14 @@ func main() {
 	}
 
 	// append 10
-	l := pool.Get().(*[]int) // <2> poolから取得。[]int{}が取れる
+	l := pool.Get().(*[]int) // <2> poolから取得。*[]int{}が取れる
 	fmt.Println("got slice", *l)
 	(*l) = append((*l), 10)
 	fmt.Println("after append", *l)
 	pool.Put(l) // <3> poolに戻す
 
 	// append 20
-	l = pool.Get().(*[]int) // <4> poolから取得。[]int{10}が取れる
+	l = pool.Get().(*[]int) // <4> poolから取得。*[]int{10}が取れる
 	fmt.Println("got slice", *l)
 	(*l) = append((*l), 20)
 	fmt.Println("after append", *l)
@@ -54,7 +54,7 @@ func main() {
 	runtime.GC() // <5> GCをすると一次的なキャッシュのPoolの中身は消える
 
 	// append 30
-	l = pool.Get().(*[]int) // <6> poolから取得。[]int{}が取れる
+	l = pool.Get().(*[]int) // <6> poolから取得。*[]int{}が取れる
 	fmt.Println("got slice", *l)
 	(*l) = append((*l), 30)
 	fmt.Println("after append", *l)
@@ -89,7 +89,19 @@ after append [30]
 - Poolから最初にGetした時は初めてインスタンスを作成するので、poolに定義したNew関数が実行されます
 - New関数の返り値はinterface型なので、型アサーション `.(*[]int)` をする必要があります
 
-- 私見ですが、型アサーションはプログラムを実行するまで気づけないので、重要な処理の場合はsync.Poolを使ったコードはテストによる動作の確認が必須と言えそうです
+- 私見ですが、型アサーションはプログラムを実行するまで気づけないので、重要な処理の場合はsync.Poolを使ったコードはテストによる動作の確認が必須だと思いました
+
+【備考】
+
+- 型アサーションの際に`ok`を返せばアサーション時の `panic`は防げます
+- 例えば、以下のようにすれば、型アサーション時の即 `panic`を避けてエラーを返すことができます
+
+```golang
+l, ok = pool.Get().(*[]string) // *[]int{}が取れるはずなのに*[]stringでアサーションした場合
+if !ok {
+	return errors.New("type assertion error")
+}
+```
 
 #### <3> Put
 
