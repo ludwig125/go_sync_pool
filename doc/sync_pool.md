@@ -2,6 +2,25 @@
 
 Go言語のsync.Poolをうまく使えば性能改善できる、という話を見たので自分の理解を深めつついろいろ検証してみました
 
+# どういった処理に対してどのくらい改善ができるか？
+
+詳細は後述しますが、まずはどういった処理がどのくらい改善したかを表にまとめました。
+
+以下の矢印の左と右は`sync.Pool使用前`->`sync.Pool使用後` を指します。
+
+関数名は記事中で書いたBenchmark関数名を記載しました。
+
+| 処理(記事中のBenchmark関数名)    |  実行速度    |  メモリアロケーション    |  実行速度改善率    |
+| --- | --- | --- | --- |
+| ログ出力（BenchmarkLog）   | 411 ns/op -> 307 ns/op | 3 allocs/op -> 1 allocs/op | 33%     |
+| 文字列結合（BenchmarkReplicateStrNTimesWithPool）| 76.7 ns/op -> 30.6 ns/op | 1 allocs/op -> 0 allocs/op | 150%(2.5倍の速度に改善)     |
+| JSON Encode Stream（BenchmarkEncodeJSONStreamWithPool）| 636 ns/op -> 577 ns/op | 5 allocs/op -> 3 allocs/op | 10% |
+| JSON Decode（BenchmarkDecodeJSONWithPool）| 1903 ns/op -> 1697 ns/op | 12 allocs/op -> 10 allocs/op | 12% |
+| JSON Decode Stream（BenchmarkDecodeJSONStreamWithPool）| 2255 ns/op -> 2075 ns/op | 15 allocs/op -> 13 allocs/op | 8.6% |
+| gzip（BenchmarkGzipWithGzipWriterPool）| 199275 ns/op -> 28469 ns/op | 21 allocs/op -> 1 allocs/op | 600%(7倍の速度に改善)  |
+| gunzip（BenchmarkGunzipWithGzipReaderPool）| 582 ns/op -> 96.8 ns/op | 3 allocs/op -> 0 allocs/op | 500%(6倍の速度に改善)  |
+
+
 # 公式の説明
 
 https://golang.org/pkg/sync/#Pool
@@ -642,7 +661,7 @@ ok      github.com/ludwig125/sync-pool/replicate_str    9.387s
 
 
 BenchmarkReplicateStrNTimesWithPoolの方は、
-メモリアロケーションが０になりました。
+メモリアロケーションが0になりました。
 
 また、BenchmarkReplicateStrNTimesの１ループ当たりの
 所要時間が`76~82ns`なのに対して、
