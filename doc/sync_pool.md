@@ -519,7 +519,7 @@ for i := 0; i < n; i++ {
 この関数に例えば`abc`という文字列を与えると、
 `[]slice{"abc","abc","abc","abc","abc"}`が返ってきます。
 
-## sync.Poolでの高速化
+## sync.PoolでのSlice操作の高速化
 
 上のReplicateStrNTimes関数をsync.Poolを使って書き直すと以下のようになります。
 
@@ -670,7 +670,7 @@ BenchmarkReplicateStrNTimesWithPoolは`24~26ns`程なので、
 ３倍くらい速くなったことがわかります。
 
 
-## sync.Poolでの高速化(nを任意の数に)
+## sync.PoolでのSlice操作の高速化(nを任意の数に)
 
 上の関数では、` make([]string, 5)`で`5`という数字が固定されてしまっていたので書き直します。
 
